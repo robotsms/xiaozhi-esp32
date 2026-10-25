@@ -17,9 +17,18 @@
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <cstring>
+#include <ctime>
 #include <limits>
 
 #define TAG "Application"
+
+namespace {
+// Alarm ringtone volume while ringing. Do NOT max it out: at 100 the loud ringtone
+// saturates the mic/AEC reference and the wake word ("你好小智") can no longer be
+// detected, so voice dismissal stops working. 85 is a modest boost over the typical
+// listening volume without clipping the reference channel.
+constexpr int kAlarmRingVolume = 85;
+}  // namespace
 
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
@@ -100,6 +109,9 @@ void Application::Initialize() {
 
     // Start the clock timer to update the status bar
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
+
+    // Load persisted alarms before exposing the alarm tools
+    alarm_manager_.Initialize();
 
     // Add MCP common tools (only once during initialization)
     auto& mcp_server = McpServer::GetInstance();
@@ -215,6 +227,10 @@ void Application::Run() {
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
+                // Loop the alarm ringtone until the alarm is dismissed.
+                if (alarm_ringing_) {
+                    audio_service_.PlaySound(Lang::Sounds::OGG_ALARM);
+                }
             }
             // Deferred listening start (auto mode): the playback queue has
             // drained, so it is now safe to enable voice processing.
@@ -275,6 +291,18 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+
+            // Fire a due alarm (one per tick; a second due alarm fires on a later tick).
+            if (has_server_time_ && !alarm_ringing_ && GetDeviceState() == kDeviceStateIdle) {
+                if (const Alarm* due = alarm_manager_.DueAlarm(time(nullptr)); due != nullptr) {
+                    StartAlarm(*due);
+                }
+            }
+
+            // Safety net: stop ringing after ~60s if the alarm is never dismissed.
+            if (alarm_ringing_ && time(nullptr) - alarm_started_at_ > 60) {
+                DismissAlarm();
+            }
 
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -771,6 +799,59 @@ void Application::DismissAlert() {
     }
 }
 
+void Application::StartAlarm(const Alarm& alarm) {
+    auto& board = Board::GetInstance();
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+
+    // Copy before Remove() invalidates the reference into the alarm vector.
+    uint32_t alarm_id = alarm.id;
+    ringing_alarm_message_ = alarm.message;
+
+    if (!SetDeviceState(kDeviceStateAlarming)) {
+        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        return;
+    }
+
+    // Consume the one-shot alarm now that it is ringing.
+    alarm_manager_.Remove(alarm_id);
+
+    alarm_ringing_ = true;
+    alarm_started_at_ = time(nullptr);
+
+    // Boost the speaker so the ringtone is clearly audible, then restore the user's
+    // volume when the alarm is dismissed. See kAlarmRingVolume for why not 100.
+    auto codec = board.GetAudioCodec();
+    if (codec != nullptr) {
+        alarm_volume_before_ = codec->output_volume();
+        codec->SetOutputVolume(kAlarmRingVolume);
+    }
+
+    audio_service_.PlaySound(Lang::Sounds::OGG_ALARM);
+    ESP_LOGI(TAG, "Alarm %u is ringing", static_cast<unsigned>(alarm_id));
+}
+
+void Application::DismissAlarm() {
+    if (!alarm_ringing_) {
+        return;
+    }
+    alarm_ringing_ = false;
+    ringing_alarm_message_.clear();
+
+    audio_service_.ResetDecoder();
+    auto& board = Board::GetInstance();
+
+    // Restore the speaker volume we boosted when the alarm started ringing.
+    auto codec = board.GetAudioCodec();
+    if (codec != nullptr) {
+        codec->SetOutputVolume(alarm_volume_before_);
+    }
+
+    board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    if (GetDeviceState() == kDeviceStateAlarming) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+}
+
 void Application::ToggleChatState() { xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT); }
 
 void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING); }
@@ -779,6 +860,12 @@ void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_
 
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
+
+    // A button click while the alarm is ringing dismisses the alarm.
+    if (state == kDeviceStateAlarming) {
+        DismissAlarm();
+        return;
+    }
 
     if (state == kDeviceStateNotifying) {
         StopNotification();
@@ -905,6 +992,9 @@ void Application::HandleWakeWordDetectedEvent() {
 
     if (state == kDeviceStateIdle) {
         BeginWakeWordInvoke(wake_word);
+    } else if (state == kDeviceStateAlarming) {
+        // Saying the wake word while the alarm is ringing dismisses it.
+        DismissAlarm();
     } else if (state == kDeviceStateNotifying) {
         StopNotification();
         BeginWakeWordInvoke(wake_word);
@@ -1055,6 +1145,12 @@ void Application::HandleStateChangedEvent() {
             break;
         case kDeviceStateNotifying:
             display->SetStatus(Lang::Strings::SPEAKING);
+            audio_service_.EnableVoiceProcessing(false);
+            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+            break;
+        case kDeviceStateAlarming:
+            display->SetStatus("Alarm");
+            display->SetChatMessage("assistant", ringing_alarm_message_.c_str());
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             break;

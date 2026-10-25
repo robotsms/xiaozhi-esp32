@@ -20,6 +20,7 @@
 #include "device_state.h"
 #include "device_state_machine.h"
 #include "notify/notify_player.h"
+#include "alarm_manager.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -88,6 +89,9 @@ public:
     void Alert(const char* status, const char* message, const char* emotion = "", const std::string_view& sound = "");
     void DismissAlert();
 
+    // Stop the currently ringing alarm. Safe to call when no alarm is ringing.
+    void DismissAlarm();
+
     void AbortSpeaking(AbortReason reason);
 
     /**
@@ -118,6 +122,8 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    bool HasServerTime() const { return has_server_time_; }
+    AlarmManager& GetAlarmManager() { return alarm_manager_; }
     
     /**
      * Reset protocol resources (thread-safe)
@@ -141,8 +147,13 @@ private:
     std::string last_error_message_;
     AudioService audio_service_;
     NotifyPlayer notify_player_;
+    AlarmManager alarm_manager_;
     uint32_t notification_playback_id_ = 0;
     std::unique_ptr<Ota> ota_;
+    bool alarm_ringing_ = false;
+    time_t alarm_started_at_ = 0;
+    std::string ringing_alarm_message_;
+    int alarm_volume_before_ = 70;  // Speaker volume to restore once the alarm stops.
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
 
@@ -171,6 +182,7 @@ private:
     void ConfigureWakeWordForListening();
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
     void StopNotification();
+    void StartAlarm(const Alarm& alarm);
     void HandleNotificationFinished(uint32_t playback_id, bool success);
 
     // Activation task (runs in background)

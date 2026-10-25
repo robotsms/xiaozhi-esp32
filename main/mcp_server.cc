@@ -9,9 +9,11 @@
 #include <esp_pthread.h>
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <iterator>
 #include <optional>
 
+#include "alarm_manager.h"
 #include "application.h"
 #include "board.h"
 #include "display.h"
@@ -56,6 +58,72 @@ void McpServer::AddCommonTools() {
             [&board](const PropertyList& properties) -> ReturnValue {
                 auto codec = board.GetAudioCodec();
                 codec->SetOutputVolume(properties["volume"].value<int>());
+                return true;
+            });
+
+    auto* alarm_manager = &Application::GetInstance().GetAlarmManager();
+
+    AddTool("self.alarm.set",
+            "Set a local alarm/reminder on this device. It fires even when the device is "
+            "offline.\n"
+            "Args:\n"
+            "  `time`: Fire time in 24-hour \"HH:MM\" format.\n"
+            "  `date`: Optional \"YYYY-MM-DD\" date. If omitted, today is used (or tomorrow if "
+            "that time has already passed today).\n"
+            "  `message`: Optional message spoken when the alarm fires.",
+            PropertyList({Property("time", kPropertyTypeString),
+                          Property("date", kPropertyTypeString, ""),
+                          Property("message", kPropertyTypeString, "")}),
+            [alarm_manager](const PropertyList& properties) -> ToolResult {
+                if (!Application::GetInstance().HasServerTime()) {
+                    return std::unexpected("Device time is not synchronized yet, try again later");
+                }
+                auto fire_at = AlarmManager::ComputeFireAt(
+                    properties["time"].value<std::string>(),
+                    properties["date"].value<std::string>(), time(nullptr));
+                if (!fire_at) {
+                    return std::unexpected(std::move(fire_at.error()));
+                }
+                auto id = alarm_manager->AddReminder(*fire_at,
+                                                      properties["message"].value<std::string>());
+                if (!id) {
+                    return std::unexpected(std::move(id.error()));
+                }
+                return static_cast<int>(*id);
+            });
+
+    AddTool("self.alarm.list", "List all local alarms/reminders set on this device.",
+            PropertyList(), [alarm_manager](const PropertyList& properties) -> ReturnValue {
+                CJsonUniquePtr array(cJSON_CreateArray());
+                for (const auto& alarm : alarm_manager->alarms()) {
+                    CJsonUniquePtr item(cJSON_CreateObject());
+                    cJSON_AddNumberToObject(item.get(), "id", alarm.id);
+                    cJSON_AddNumberToObject(item.get(), "fire_at",
+                                            static_cast<double>(alarm.fire_at));
+                    if (!alarm.message.empty()) {
+                        cJSON_AddStringToObject(item.get(), "message", alarm.message.c_str());
+                    }
+                    cJSON_AddItemToArray(array.get(), item.release());
+                }
+                CJsonStringUniquePtr json_str(cJSON_PrintUnformatted(array.get()));
+                return json_str != nullptr ? std::string(json_str.get()) : std::string("[]");
+            });
+
+    AddTool("self.alarm.delete",
+            "Delete a local alarm/reminder by id. If no id is given, delete all alarms.",
+            PropertyList({Property("id", kPropertyTypeInteger, -1)}),
+            [alarm_manager](const PropertyList& properties) -> ReturnValue {
+                int id = properties["id"].value<int>();
+                if (id < 0) {
+                    alarm_manager->RemoveAll();
+                    return true;
+                }
+                return alarm_manager->Remove(static_cast<uint32_t>(id));
+            });
+
+    AddTool("self.alarm.dismiss", "Stop the currently ringing alarm/reminder.", PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                Application::GetInstance().DismissAlarm();
                 return true;
             });
 
