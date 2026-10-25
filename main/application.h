@@ -153,7 +153,6 @@ private:
     bool alarm_ringing_ = false;
     time_t alarm_started_at_ = 0;
     std::string ringing_alarm_message_;
-    int alarm_volume_before_ = 70;  // Speaker volume to restore once the alarm stops.
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
 

@@ -22,14 +22,6 @@
 
 #define TAG "Application"
 
-namespace {
-// Alarm ringtone volume while ringing. Do NOT max it out: at 100 the loud ringtone
-// saturates the mic/AEC reference and the wake word ("你好小智") can no longer be
-// detected, so voice dismissal stops working. 85 is a modest boost over the typical
-// listening volume without clipping the reference channel.
-constexpr int kAlarmRingVolume = 85;
-}  // namespace
-
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
 
@@ -818,14 +810,6 @@ void Application::StartAlarm(const Alarm& alarm) {
     alarm_ringing_ = true;
     alarm_started_at_ = time(nullptr);
 
-    // Boost the speaker so the ringtone is clearly audible, then restore the user's
-    // volume when the alarm is dismissed. See kAlarmRingVolume for why not 100.
-    auto codec = board.GetAudioCodec();
-    if (codec != nullptr) {
-        alarm_volume_before_ = codec->output_volume();
-        codec->SetOutputVolume(kAlarmRingVolume);
-    }
-
     audio_service_.PlaySound(Lang::Sounds::OGG_ALARM);
     ESP_LOGI(TAG, "Alarm %u is ringing", static_cast<unsigned>(alarm_id));
 }
@@ -839,12 +823,6 @@ void Application::DismissAlarm() {
 
     audio_service_.ResetDecoder();
     auto& board = Board::GetInstance();
-
-    // Restore the speaker volume we boosted when the alarm started ringing.
-    auto codec = board.GetAudioCodec();
-    if (codec != nullptr) {
-        codec->SetOutputVolume(alarm_volume_before_);
-    }
 
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
     if (GetDeviceState() == kDeviceStateAlarming) {
